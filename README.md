@@ -16,7 +16,7 @@ GoLoadTest 是一个用 Go 语言编写的高性能 API 负载测试工具。它
 
 确保您已安装 Go 1.16 或更高版本，然后运行以下命令：
 ```bash
-git clone https://github.com/tysam/goloadtest.git
+git clone https://github.com/tyxben/goloadtest.git
 cd goloadtest
 go build -o goloadtest cmd/main.go
 ```
