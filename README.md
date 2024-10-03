@@ -25,7 +25,7 @@ go build -o goloadtest cmd/main.go
 ### config.json
 
 此文件包含测试的全局配置。
-
+当totalRequests 大于0时，duration不生效。当totalRequests == 0 duration生效。
 ```json
 {
   "concurrency": 1,
