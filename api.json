@@ -1,0 +1,33 @@
+{
+    "login": {
+      "url": "/airdrop/login",
+      "method": "POST",
+      "body": {
+        "type": "wallet",
+        "wallet_addr": "{{walletAddr}}",
+        "text": "{{text}}",
+        "signature": "{{signature}}"
+      },
+      "response": {
+        "token": "token"
+      },
+      "params": ["walletAddr", "text", "signature"]
+    },
+    "userInfo": {
+      "url": "/airdrop/user/info",
+      "method": "GET",
+      "headers": {
+        "Authorization": "{{token}}"
+      },
+      "params": []
+    },
+    "stakingSpecialInfo": {
+      "url": "/explorer_testnet/staking_special_info",
+      "method": "GET",
+      "params": ["walletAddr", "amount"],
+      "queryParams": {
+        "wallet_addr": "{{walletAddr}}",
+        "amount": "{{amount}}"
+      }
+    }
+  }

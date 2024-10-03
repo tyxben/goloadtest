@@ -1,0 +1,8 @@
+{
+  "concurrency": 1,
+  "duration": 1,
+  "totalRequests" : 1,
+  "workflow": ["login", "userInfo",],
+  "tokenHeader": "Authorization",
+  "baseURL": "http://localhost:8080"
+}
