@@ -8,10 +8,12 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/tidwall/gjson"
 	"github.com/tyxben/goloadtest/pkg/config"
 )
 
@@ -23,23 +25,46 @@ type Result struct {
 	Response   json.RawMessage
 }
 
+// TestDataQueue 是一个只读的并发安全队列
+type TestDataQueue struct {
+	data  []map[string]string
+	index int64
+}
+
+// NewTestDataQueue 创建一个新的 TestDataQueue 并一次性写入所有数据
+func NewTestDataQueue(testData []map[string]string) *TestDataQueue {
+	return &TestDataQueue{
+		data:  testData,
+		index: 0,
+	}
+}
+
+// Next 返回队列中的下一个测试数据，如果所有数据都已被读取则返回 nil
+func (q *TestDataQueue) Next() map[string]string {
+	index := atomic.AddInt64(&q.index, 1) - 1
+	if int(index) >= len(q.data) {
+		return nil
+	}
+	return q.data[index]
+}
+
 func Run(cfg *config.Config, tasks <-chan struct{}, results chan<- Result) {
 	client := &http.Client{
 		Timeout: time.Second * 10,
 	}
+	testDataQueue := NewTestDataQueue(cfg.TestData)
 
-	testDataIndex := 0
 	for range tasks {
 		sessionData := make(map[string]interface{})
 		if len(cfg.TestData) > 0 {
-			if testDataIndex >= len(cfg.TestData) {
-				testDataIndex = 0 // 循环使用测试数据
+			testData := testDataQueue.Next()
+			if testData == nil {
+				asyncLog("警告: 所有测试数据已用完")
+				break
 			}
-			// 从测试数据中读取所有列
-			for key, value := range cfg.TestData[testDataIndex] {
+			for key, value := range testData {
 				sessionData[key] = value
 			}
-			testDataIndex++
 		}
 
 		for _, apiName := range cfg.Workflow {
@@ -71,7 +96,6 @@ func callAPI(client *http.Client, apiUrl string, apiConfig config.APIConfig, ses
 	start := time.Now()
 
 	// 准备查询参数
-	log.Printf("apiConfig.QueryParams: %v", apiConfig.QueryParams)
 	if len(apiConfig.QueryParams) > 0 {
 		queryParams := make(url.Values)
 		for key, value := range apiConfig.QueryParams {
@@ -107,9 +131,10 @@ func callAPI(client *http.Client, apiUrl string, apiConfig config.APIConfig, ses
 
 	req, err := http.NewRequest(apiConfig.Method, apiUrl, bytes.NewReader(body))
 	if err != nil {
-		log.Printf("创建请求失败: %v", err)
+		asyncLog("创建请求失败: %v", err)
 		return Result{Error: err}
 	}
+	req.Header.Set("Content-Type", "application/json")
 
 	// 设置请求头
 	for k, v := range apiConfig.Headers {
@@ -118,14 +143,26 @@ func callAPI(client *http.Client, apiUrl string, apiConfig config.APIConfig, ses
 
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("发送请求失败: %v", err)
+		asyncLog("发送请求失败: %v", err)
 		return Result{Error: err}
 	}
 	defer resp.Body.Close()
 
 	responseBody, _ := ioutil.ReadAll(resp.Body)
 	duration := time.Since(start)
-	log.Printf("API 响应时间: %v", duration)
+	//check if responseBody 包含code 且非 0 输出
+	var responseMap map[string]interface{}
+	err = json.Unmarshal(responseBody, &responseMap)
+	if err != nil {
+		asyncLog("警告: 无法解析响应 JSON: %v", err)
+		return Result{Error: err}
+	}
+	if code, ok := responseMap["code"]; ok && code != 0 {
+		// 打印 对应的地址
+		if walletAddr, ok := sessionData["walletAddr"]; ok {
+			asyncLog("响应包含错误码: %v, 地址: %v", code, walletAddr)
+		}
+	}
 
 	return Result{
 		StatusCode: resp.StatusCode,
@@ -135,20 +172,47 @@ func callAPI(client *http.Client, apiUrl string, apiConfig config.APIConfig, ses
 }
 
 func handleResponse(response json.RawMessage, responseConfig map[string]string, sessionData map[string]interface{}) {
-	for key, jsonPath := range responseConfig {
-		result := gjson.GetBytes(response, jsonPath)
-		if !result.Exists() {
-			log.Printf("警告: 在响应中未找到路径 %s", jsonPath)
-			continue
-		}
 
-		value := result.String()
-		if value != "" {
+	// 解析整个 JSON 响应
+	var responseMap map[string]interface{}
+	err := json.Unmarshal(response, &responseMap)
+	if err != nil {
+		asyncLog("警告: 无法解析响应 JSON: %v", err)
+		return
+	}
+
+	// 处理 responseConfig 中指定的所有字段
+	for key, fieldName := range responseConfig {
+		value := findFieldRecursively(responseMap, fieldName)
+		if value != nil {
 			sessionData[key] = value
 		} else {
-			log.Printf("警告: 提取的值为空")
+			asyncLog("警告: %s 在响应中未找到字段 %s", response, fieldName)
+
 		}
 	}
+}
+
+// 递归查找指定字段名的值
+func findFieldRecursively(data interface{}, fieldName string) interface{} {
+	switch v := data.(type) {
+	case map[string]interface{}:
+		for key, value := range v {
+			if key == fieldName {
+				return value
+			}
+			if result := findFieldRecursively(value, fieldName); result != nil {
+				return result
+			}
+		}
+	case []interface{}:
+		for _, item := range v {
+			if result := findFieldRecursively(item, fieldName); result != nil {
+				return result
+			}
+		}
+	}
+	return nil
 }
 
 func replaceSessionData(value string, sessionData map[string]interface{}) string {
@@ -161,20 +225,29 @@ func replaceSessionData(value string, sessionData map[string]interface{}) string
 	return value
 }
 
-func prepareBody(bodyTemplate json.RawMessage, sessionData map[string]interface{}) []byte {
-	if len(bodyTemplate) == 0 {
-		return nil
+var (
+	logChan chan string
+	logWg   sync.WaitGroup
+)
+
+func init() {
+	logChan = make(chan string, 1000) // 缓冲区大小可以根据需要调整
+	logWg.Add(1)
+	go logWriter()
+}
+
+func logWriter() {
+	defer logWg.Done()
+	logger := log.New(os.Stderr, "", log.LstdFlags)
+	for msg := range logChan {
+		logger.Println(msg)
 	}
+}
 
-	var bodyMap map[string]interface{}
-	json.Unmarshal(bodyTemplate, &bodyMap)
-
-	for k, v := range bodyMap {
-		if strValue, ok := v.(string); ok && strValue == "{{sessionData}}" {
-			bodyMap[k] = sessionData[k]
-		}
+func asyncLog(format string, v ...interface{}) {
+	select {
+	case logChan <- fmt.Sprintf(format, v...):
+	default:
+		// 如果通道已满，丢弃日志消息
 	}
-
-	body, _ := json.Marshal(bodyMap)
-	return body
 }
