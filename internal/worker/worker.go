@@ -11,7 +11,6 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/tyxben/goloadtest/pkg/config"
@@ -25,46 +24,47 @@ type Result struct {
 	Response   json.RawMessage
 }
 
-// TestDataQueue 是一个只读的并发安全队列
+// TestDataQueue 是一个线程安全的队列，用于存储测试数据
 type TestDataQueue struct {
 	data  []map[string]string
-	index int64
+	mutex sync.Mutex
 }
 
-// NewTestDataQueue 创建一个新的 TestDataQueue 并一次性写入所有数据
+// NewTestDataQueue 创建一个新的 TestDataQueue 并预加载所有数据
 func NewTestDataQueue(testData []map[string]string) *TestDataQueue {
 	return &TestDataQueue{
-		data:  testData,
-		index: 0,
+		data: testData,
 	}
 }
 
-// Next 返回队列中的下一个测试数据，如果所有数据都已被读取则返回 nil
+// Next 返回队列中的下一个测试数据，如果队列为空则返回 nil
 func (q *TestDataQueue) Next() map[string]string {
-	index := atomic.AddInt64(&q.index, 1) - 1
-	if int(index) >= len(q.data) {
+	q.mutex.Lock()
+	defer q.mutex.Unlock()
+
+	if len(q.data) == 0 {
 		return nil
 	}
-	return q.data[index]
+
+	item := q.data[0]
+	q.data = q.data[1:]
+	return item
 }
 
-func Run(cfg *config.Config, tasks <-chan struct{}, results chan<- Result) {
+func Run(cfg *config.Config, tasks <-chan struct{}, results chan<- Result, testDataQueue *TestDataQueue) {
 	client := &http.Client{
 		Timeout: time.Second * 10,
 	}
-	testDataQueue := NewTestDataQueue(cfg.TestData)
 
 	for range tasks {
 		sessionData := make(map[string]interface{})
-		if len(cfg.TestData) > 0 {
-			testData := testDataQueue.Next()
-			if testData == nil {
-				asyncLog("警告: 所有测试数据已用完")
-				break
-			}
-			for key, value := range testData {
-				sessionData[key] = value
-			}
+		testData := testDataQueue.Next()
+		if testData == nil {
+			asyncLog("警告: 所有测试数据已用完")
+			break
+		}
+		for key, value := range testData {
+			sessionData[key] = value
 		}
 
 		for _, apiName := range cfg.Workflow {
@@ -157,13 +157,16 @@ func callAPI(client *http.Client, apiUrl string, apiConfig config.APIConfig, ses
 		asyncLog("警告: 无法解析响应 JSON: %v", err)
 		return Result{Error: err}
 	}
-	if code, ok := responseMap["code"]; ok && code != 0 {
-		// 打印 对应的地址
-		if walletAddr, ok := sessionData["walletAddr"]; ok {
-			asyncLog("响应包含错误码: %v, 地址: %v", code, walletAddr)
+	if code, ok := responseMap["code"]; ok {
+		// 将 code 转换为整数进行比较
+		codeInt, isInt := code.(float64)
+		if isInt && int(codeInt) != 0 {
+			if walletAddr, ok := sessionData["walletAddr"]; ok {
+				asyncLog("响应包含错误码: %v, 地址: %v", int(codeInt), walletAddr)
+			}
 		}
 	}
-
+	asyncLog("地址%s,响应: %v", sessionData["walletAddr"], string(responseBody))
 	return Result{
 		StatusCode: resp.StatusCode,
 		Duration:   duration,

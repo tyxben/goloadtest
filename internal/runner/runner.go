@@ -27,13 +27,15 @@ func (r *Runner) Run() {
 	tasks := make(chan struct{}, r.Config.Concurrency)
 	results := make(chan worker.Result)
 
+	testDataQueue := worker.NewTestDataQueue(r.Config.TestData)
+
 	var wg sync.WaitGroup
 	for i := 0; i < r.Config.Concurrency; i++ {
 		wg.Add(1)
 		go func(index int) {
 			defer wg.Done()
 			log.Printf("启动工作协程 #%d", index)
-			worker.Run(r.Config, tasks, results)
+			worker.Run(r.Config, tasks, results, testDataQueue)
 		}(i)
 	}
 
